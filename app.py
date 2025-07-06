@@ -3,7 +3,7 @@ import serial.tools.list_ports
 import threading
 import dash
 from dash import html, dcc
-from dash.dependencies import Output, Input
+from dash.dependencies import Output, Input, State
 import dash_bootstrap_components as dbc
 import plotly.graph_objs as go
 import numpy as np
@@ -11,6 +11,7 @@ import time
 import sys
 from datetime import datetime, timedelta
 from dash import dash_table
+from collections import deque
 
 # Detectar puerto Arduino
 def detectar_puerto_arduino():
@@ -32,14 +33,17 @@ except serial.SerialException as e:
     print(f"❌ No se pudo abrir el puerto {puerto}:\n{e}")
     sys.exit()
 
-humedad_valor = 0  # Valor inicial de humedad
-nivel_riego_valor = 0  # Valor inicial de porcentaje de agua
-temperatura_valor = 0  # Valor inicial de temperatura
-is_connected = True  # Estado de conexión
-target_humedad = 0  # Valor objetivo para transición suave
-target_agua = 0     # Valor objetivo para transición suave
-target_temperatura = 0  # Valor objetivo para transición suave
-data_history = []   # Lista para almacenar datos: [timestamp, humedad, agua, temperatura]
+# Variables globales
+humedad_valor = 0
+nivel_riego_valor = 0
+temperatura_valor = 0
+humedad_ambiente_valor = 0
+is_connected = True
+target_humedad = 0
+target_agua = 0
+target_temperatura = 0
+target_humedad_ambiente = 0
+data_history = deque(maxlen=10)
 
 def check_and_reconnect():
     global arduino, is_connected, puerto
@@ -54,69 +58,60 @@ def check_and_reconnect():
                     is_connected = True
                 except serial.SerialException as e:
                     print(f"❌ Error al reconectar: {e}")
-        time.sleep(2)  # Verificar cada 2 segundos
+        time.sleep(2)
 
 def leer_serial():
-    global humedad_valor, nivel_riego_valor, temperatura_valor, is_connected, target_humedad, target_agua, target_temperatura, data_history
-    time.sleep(2)  # Esperar para que el Arduino se estabilice
+    global humedad_valor, nivel_riego_valor, temperatura_valor, humedad_ambiente_valor, is_connected, target_humedad, target_agua, target_temperatura, target_humedad_ambiente, data_history
+    time.sleep(2)
     while True:
         try:
             if arduino.in_waiting > 0:
                 data = arduino.readline().decode('utf-8').strip()
-                # Verificar formato "Humedad: X% | Temperatura: Y°C"
-                if "Humedad" in data and "Temperatura" in data:
+                if "Humedad Suelo" in data and "Temperatura" in data and "Humedad Ambiente" in data:
                     try:
-                        # Extraer humedad y temperatura
                         humedad_str = data.split("|")[0].split(":")[1].strip().replace("%", "")
                         temperatura_str = data.split("|")[1].split(":")[1].strip().replace("°C", "")
+                        humedad_ambiente_str = data.split("|")[2].split(":")[1].strip().replace("%", "")
                         target_humedad = int(humedad_str)
-                        target_agua = target_humedad  # Mantener lógica original
+                        target_agua = target_humedad
                         target_temperatura = float(temperatura_str)
+                        target_humedad_ambiente = float(humedad_ambiente_str)
                         is_connected = True
-                        # Almacenar datos con timestamp
                         timestamp = datetime.now().strftime("%H:%M:%S")
-                        data_history.append([timestamp, target_humedad, target_agua, target_temperatura])
-                        # Mantener solo las últimas 10 entradas
-                        if len(data_history) > 10:
-                            data_history.pop(0)
+                        data_history.append([timestamp, target_humedad, target_agua, target_temperatura, target_humedad_ambiente])
                     except (ValueError, IndexError) as e:
-                        print(f"Dato inválido recibido: {data}, Error: {e}")
-                else:
-                    print(f"Dato inválido recibido: {data}")
-            time.sleep(0.1)  # Pequeña espera para no sobrecargar la CPU
+                        print(f"Dato inválido: {data}, Error: {e}")
+            time.sleep(0.05)
         except (serial.SerialException, ValueError) as e:
             print(f"Error en lectura serial: {e}")
             is_connected = False
             target_humedad = 0
             target_agua = 0
             target_temperatura = 0
-            time.sleep(1)  # Esperar antes de reintentar
+            target_humedad_ambiente = 0
+            time.sleep(1)
 
 threading.Thread(target=leer_serial, daemon=True).start()
 threading.Thread(target=check_and_reconnect, daemon=True).start()
 
-# Función para obtener datos de la última hora
 def obtener_valores_ultima_hora(data_history):
     ahora = datetime.now()
     una_hora_atras = ahora - timedelta(hours=1)
     valores_ultima_hora = []
-
     for row in data_history:
         timestamp_str = row[0]
         try:
             timestamp = datetime.strptime(timestamp_str, "%H:%M:%S")
             timestamp = timestamp.replace(year=ahora.year, month=ahora.month, day=ahora.day)
-        except:
+            if timestamp >= una_hora_atras:
+                valores_ultima_hora.append(row)
+        except ValueError:
             continue
-
-        if timestamp >= una_hora_atras:
-            valores_ultima_hora.append(row)
-
     return valores_ultima_hora
 
-# Estilos y scripts externos
+# Estilos para tema oscuro
 external_stylesheets = [
-    "https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css",
+    dbc.themes.DARKLY,
     "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css",
 ]
 external_scripts = [
@@ -126,67 +121,89 @@ external_scripts = [
 
 app = dash.Dash(__name__, external_stylesheets=external_stylesheets, external_scripts=external_scripts)
 
-# Layout del dashboard
-app.layout = html.Div(className="hold-transition sidebar-mini layout-fixed", children=[
+app.layout = html.Div(id="main-container", className="hold-transition sidebar-mini layout-fixed", style={'backgroundColor': '#1e2b33'}, children=[
     html.Div(className="wrapper", children=[
         html.Div(className="content-wrapper", children=[
             html.Div(className="content-header", children=[
                 html.Div(className="container-fluid", children=[
-                    html.H1("AgroDuino 🌱", className="m-0"),
-                    dbc.Alert(id="notification-alert", is_open=False, duration=5000, color="primary", dismissable=True,
-                              className="notification-alert")
+                    html.Div(className="d-flex justify-content-between align-items-center", children=[
+                        html.H1("AgroDuino 🌱", className="m-0 text-center")
+                    ]),
+                    html.Div(className="mt-2", children=[
+                        dbc.Alert(id="connection-alert", is_open=False, duration=5000, color="warning", dismissable=True, className="notification-alert mb-2"),
+                        dbc.Alert(id="humedad-alert", is_open=False, duration=5000, color="primary", dismissable=True, className="notification-alert mb-2"),
+                        dbc.Alert(id="temperatura-alert", is_open=False, duration=5000, color="primary", dismissable=True, className="notification-alert mb-2"),
+                        dbc.Alert(id="humedad-ambiente-alert", is_open=False, duration=5000, color="primary", dismissable=True, className="notification-alert mb-2")
+                    ])
                 ])
             ]),
             html.Section(className="content", children=[
                 html.Div(className="container-fluid", children=[
-                    # Fila de gauges
                     html.Div(className="row", children=[
-                        html.Div(className="col-md-4", children=[
+                        html.Div(className="col-md-3", children=[
                             html.Div(className="card border-left-primary shadow h-100 py-2", children=[
                                 html.Div(className="card-body", children=[
                                     html.Div(className="row no-gutters align-items-center", children=[
                                         html.Div(className="col mr-2", children=[
-                                            html.Div("Humedad del Suelo (%)", className="text-xs font-weight-bold text-primary text-uppercase mb-1 text-center"),
-                                            html.Div(id="humedad-gauge", className="h5 mb-0 font-weight-bold text-gray-800")
+                                            html.Div("Humedad del Suelo (%)", className="text-xs font-weight-bold text-info text-uppercase mb-1 text-center"),
+                                            html.Div(html.I(className="fas fa-tint fa-2x", style={'color': '#4e73df'}), className="text-center mb-2"),
+                                            html.Div(id="humedad-gauge")
                                         ])
                                     ])
                                 ])
                             ])
                         ]),
-                        html.Div(className="col-md-4", children=[
+                        html.Div(className="col-md-3", children=[
                             html.Div(className="card border-left-info shadow h-100 py-2", children=[
                                 html.Div(className="card-body", children=[
                                     html.Div(className="row no-gutters align-items-center", children=[
                                         html.Div(className="col mr-2", children=[
                                             html.Div("Porcentaje de Agua (%)", className="text-xs font-weight-bold text-info text-uppercase mb-1 text-center"),
-                                            html.Div(id="agua-gauge", className="h5 mb-0 font-weight-bold text-gray-800")
+                                            html.Div(html.I(className="fas fa-water fa-2x", style={'color': '#36b9cc'}), className="text-center mb-2"),
+                                            html.Div(id="agua-gauge")
                                         ])
                                     ])
                                 ])
                             ])
                         ]),
-                        html.Div(className="col-md-4", children=[
+                        html.Div(className="col-md-3", children=[
                             html.Div(className="card border-left-info shadow h-100 py-2", children=[
                                 html.Div(className="card-body", children=[
                                     html.Div(className="row no-gutters align-items-center", children=[
                                         html.Div(className="col mr-2", children=[
-                                            html.Div("Temperatura (°C)", className="text-xs font-weight-bold text-info text-uppercase mb-1 text-center"),
-                                            html.Div(id="temperatura-gauge", className="h5 mb-0 font-weight-bold text-gray-800")
+                                            html.Div("Temperatura (°C)", className="text-xs font-weight-bold text-danger text-uppercase mb-1 text-center"),
+                                            html.Div(html.I(className="fas fa-thermometer-half fa-2x", style={'color': '#e74a3b'}), className="text-center mb-2"),
+                                            html.Div(id="temperatura-gauge")
+                                        ])
+                                    ])
+                                ])
+                            ])
+                        ]),
+                        html.Div(className="col-md-3", children=[
+                            html.Div(className="card border-left-success shadow h-100 py-2", children=[
+                                html.Div(className="card-body", children=[
+                                    html.Div(className="row no-gutters align-items-center", children=[
+                                        html.Div(className="col mr-2", children=[
+                                            html.Div("Humedad Ambiental (%)", className="text-xs font-weight-bold text-success text-uppercase mb-1 text-center"),
+                                            html.Div(html.I(className="fas fa-cloud fa-2x", style={'color': '#1cc88a'}), className="text-center mb-2"),
+                                            html.Div(id="humedad-ambiente-gauge")
                                         ])
                                     ])
                                 ])
                             ])
                         ])
                     ]),
-                    # Fila de Tasks y Pending Requests
                     html.Div(className="row mt-4", children=[
                         html.Div(className="col-md-6", children=[
                             html.Div(className="card border-left-success shadow h-100 py-2", children=[
                                 html.Div(className="card-body", children=[
                                     html.Div(className="row no-gutters align-items-center", children=[
                                         html.Div(className="col mr-2", children=[
-                                            html.Div("Tasks", className="text-xs font-weight-bold text-success text-uppercase mb-1 text-center"),
-                                            html.Div(id="tasks-text", className="h5 mb-0 font-weight-bold text-gray-800"),
+                                            html.Div(children=[
+                                                html.I(className="fas fa-tasks mr-2"),
+                                                " Gestión de Riego"
+                                            ], className="text-xs font-weight-bold text-success text-uppercase mb-1 text-center"),
+                                            html.Div(id="tasks-text", className="h5 mb-0 font-weight-bold"),
                                             html.Div(className="progress", children=[
                                                 html.Div(id="tasks-bar-style", className="progress-bar bg-success", style={"width": "0%"})
                                             ])
@@ -200,8 +217,11 @@ app.layout = html.Div(className="hold-transition sidebar-mini layout-fixed", chi
                                 html.Div(className="card-body", children=[
                                     html.Div(className="row no-gutters align-items-center", children=[
                                         html.Div(className="col mr-2", children=[
-                                            html.Div("Pending Requests", className="text-xs font-weight-bold text-warning text-uppercase mb-1 text-center"),
-                                            html.Div(id="pending-text", className="h5 mb-0 font-weight-bold text-gray-800"),
+                                            html.Div(children=[
+                                                html.I(className="fas fa-hourglass-half mr-2"),
+                                                " Evaluación de Condiciones"
+                                            ], className="text-xs font-weight-bold text-warning text-uppercase mb-1 text-center"),
+                                            html.Div(id="pending-text", className="h5 mb-0 font-weight-bold"),
                                             html.Div(className="progress", children=[
                                                 html.Div(id="pending-bar-style", className="progress-bar bg-warning", style={"width": "0%"})
                                             ])
@@ -211,9 +231,8 @@ app.layout = html.Div(className="hold-transition sidebar-mini layout-fixed", chi
                             ])
                         ])
                     ]),
-                    # Fila de tabla y gráficos
                     html.Div(className="row mt-4 text-center", children=[
-                        html.Div(className="col-md-4", children=[
+                        html.Div(className="col-md-3", children=[
                             html.Div(className="card", children=[
                                 html.Div(className="card-header", children=[
                                     html.H3("Historial de Datos", className="card-title")
@@ -223,41 +242,60 @@ app.layout = html.Div(className="hold-transition sidebar-mini layout-fixed", chi
                                         id='data-table',
                                         columns=[
                                             {"name": "Hora", "id": "timestamp"},
-                                            {"name": "Humedad (%)", "id": "humedad"},
-                                            # {"name": "Agua (%)", "id": "agua"},
-                                            {"name": "Temperatura (°C)", "id": "temperatura"}
+                                            {"name": "Humedad Suelo (%)", "id": "humedad"},
+                                            {"name": "Temperatura (°C)", "id": "temperatura"},
+                                            {"name": "Humedad Ambiental (%)", "id": "humedad_ambiente"}
                                         ],
-                                        style_table={'overflowX': 'auto'},
-                                        style_cell={'textAlign': 'center', 'padding': '8px', 'border': '1px solid #dee2e6', 'backgroundColor': 'white'},
+                                        style_table={'overflowX': 'auto', 'backgroundColor': '#1e2b33'},
+                                        style_cell={'textAlign': 'center', 'padding': '8px', 'border': '1px solid #4b5e6b', 'backgroundColor': '#2c3b41', 'color': '#e0e0e0'},
                                         style_header={'backgroundColor': '#007bff', 'color': 'white', 'fontWeight': 'bold', 'border': 'none'},
                                         style_data_conditional=[
                                             {
                                                 'if': {'state': 'active'},
-                                                'backgroundColor': '#f8f9fa',
-                                                'color': '#6c757d'
+                                                'backgroundColor': '#495057',
+                                                'color': '#e0e0e0'
                                             }
                                         ]
                                     )
                                 ])
                             ])
                         ]),
-                        html.Div(className="col-md-4 graph-card text-center", children=[
+                        html.Div(className="col-md-3 graph-card text-center", children=[
                             html.Div(className="card", children=[
                                 html.Div(className="card-header", children=[
-                                    html.H3("Tendencia de Humedad", className="card-title")
+                                    html.H3(children=[
+                                        "Tendencia de Humedad ",
+                                        html.I(className="fas fa-tint ml-2", style={'color': '#4e73df'})
+                                    ], className="card-title d-flex align-items-center justify-content-center", style={'color': '#4e73df'})
                                 ]),
                                 html.Div(className="card-body", children=[
                                     dcc.Graph(id='humidity-bar-graph')
                                 ])
                             ])
                         ]),
-                        html.Div(className="col-md-4 graph-card text-center", children=[
+                        html.Div(className="col-md-3 graph-card text-center", children=[
                             html.Div(className="card", children=[
                                 html.Div(className="card-header", children=[
-                                    html.H3("Tendencia de Temperatura", className="card-title")
+                                    html.H3(children=[
+                                        "Tendencia de Temperatura ",
+                                        html.I(className="fas fa-thermometer-half ml-2", style={'color': '#e74a3b'})
+                                    ], className="card-title d-flex align-items-center justify-content-center", style={'color': '#e74a3b'})
                                 ]),
                                 html.Div(className="card-body", children=[
                                     dcc.Graph(id='temperature-line-graph')
+                                ])
+                            ])
+                        ]),
+                        html.Div(className="col-md-3 graph-card text-center", children=[
+                            html.Div(className="card", children=[
+                                html.Div(className="card-header", children=[
+                                    html.H3(children=[
+                                        "Humedad Ambiental",
+                                        html.I(className="fas fa-cloud ml-2", style={'color': '#1cc88a'})
+                                    ], className="card-title d-flex align-items-center justify-content-center", style={'color': '#1cc88a'})
+                                ]),
+                                html.Div(className="card-body", children=[
+                                    dcc.Graph(id='humedad-ambiente-bar-graph')
                                 ])
                             ])
                         ])
@@ -267,27 +305,26 @@ app.layout = html.Div(className="hold-transition sidebar-mini layout-fixed", chi
         ]),
         html.Footer("© 2025 AgroDuino.", className="main-footer")
     ]),
-    dcc.Interval(id='interval-component', interval=100, n_intervals=0)
+    dcc.Interval(id='interval-component', interval=1500, n_intervals=0)
 ])
 
-# Función para crear gauge semicircular
 def semicircular_gauge(current_value, target_value, colors, title, suffix="%", is_active=True, max_value=100):
     if not is_active:
         current_value = 0
-        colors = {'bar': '#cccccc', 'background': '#e0e0e0'}
+        colors = {'bar': '#cccccc', 'background': '#4b5e6b'}
     elif abs(current_value - target_value) > 0:
-        current_value += np.sign(target_value - current_value) * min(5, abs(target_value - current_value))
+        current_value += np.sign(target_value - current_value) * min(15, abs(target_value - current_value))
     val = np.clip(current_value, 0, max_value)
 
     fig = go.Figure(go.Indicator(
         mode="gauge+number",
         value=val,
         gauge={
-            'axis': {'range': [0, max_value], 'tickwidth': 1},
+            'axis': {'range': [0, max_value], 'tickwidth': 1, 'tickcolor': '#e0e0e0'},
             'bar': {'color': colors['bar']},
             'bgcolor': colors['background'],
             'borderwidth': 2,
-            'bordercolor': "#fff",
+            'bordercolor': '#4b5e6b',
             'steps': [{'range': [0, max_value], 'color': colors['background']}],
             'threshold': {'line': {'color': "red", 'width': 4}, 'thickness': 0.75, 'value': max_value}
         },
@@ -298,119 +335,148 @@ def semicircular_gauge(current_value, target_value, colors, title, suffix="%", i
     fig.update_layout(
         margin=dict(t=20, b=0, l=0, r=0),
         height=150,
-        paper_bgcolor='rgba(0,0,0,0)',
-        font={'color': "white" if is_active else "#888"},
+        paper_bgcolor='#1e2b33',
+        plot_bgcolor='#1e2b33',
+        font={'color': '#e0e0e0'},
         annotations=[dict(text=title, x=0.5, y=1.1, showarrow=False,
-                          font=dict(size=12, color='black' if is_active else '#888'), xanchor='center')]
+                          font=dict(size=12, color='#e0e0e0'), xanchor='center')]
     )
     return fig, current_value
 
-# Callback para actualizar dashboard
+# Callback para gauges
 @app.callback(
     [Output('humedad-gauge', 'children'),
      Output('agua-gauge', 'children'),
      Output('temperatura-gauge', 'children'),
-     Output('notification-alert', 'children'),
-     Output('notification-alert', 'is_open'),
-     Output('notification-alert', 'color'),
-     Output('data-table', 'data'),
+     Output('humedad-ambiente-gauge', 'children')],
+    [Input('interval-component', 'n_intervals')]
+)
+def update_gauges(n):
+    global humedad_valor, nivel_riego_valor, temperatura_valor, humedad_ambiente_valor, is_connected, target_humedad, target_agua, target_temperatura, target_humedad_ambiente
+    fig_hum, humedad_valor = semicircular_gauge(humedad_valor, target_humedad,
+                                              colors={'bar': '#4e73df', 'background': '#4b5e6b'},
+                                              title="Humedad Suelo", is_active=is_connected)
+    fig_agua, nivel_riego_valor = semicircular_gauge(nivel_riego_valor, target_agua,
+                                                   colors={'bar': '#36b9cc', 'background': '#4b5e6b'},
+                                                   title="Agua", is_active=is_connected)
+    fig_temp, temperatura_valor = semicircular_gauge(temperatura_valor, target_temperatura,
+                                                   colors={'bar': '#e74a3b', 'background': '#4b5e6b'},
+                                                   title="Temperatura", suffix="°C", is_active=is_connected, max_value=50)
+    fig_hum_amb, humedad_ambiente_valor = semicircular_gauge(humedad_ambiente_valor, target_humedad_ambiente,
+                                                            colors={'bar': '#1cc88a', 'background': '#4b5e6b'},
+                                                            title="Humedad Ambiental", is_active=is_connected)
+    return dcc.Graph(figure=fig_hum), dcc.Graph(figure=fig_agua), dcc.Graph(figure=fig_temp), dcc.Graph(figure=fig_hum_amb)
+
+# Callback para notificaciones
+@app.callback(
+    [Output('connection-alert', 'children'),
+     Output('connection-alert', 'is_open'),
+     Output('connection-alert', 'color'),
+     Output('humedad-alert', 'children'),
+     Output('humedad-alert', 'is_open'),
+     Output('humedad-alert', 'color'),
+     Output('temperatura-alert', 'children'),
+     Output('temperatura-alert', 'is_open'),
+     Output('temperatura-alert', 'color'),
+     Output('humedad-ambiente-alert', 'children'),
+     Output('humedad-ambiente-alert', 'is_open'),
+     Output('humedad-ambiente-alert', 'color')],
+    Input('interval-component', 'n_intervals')
+)
+def update_notifications(n):
+    global is_connected, target_humedad, target_temperatura, target_humedad_ambiente
+    if not is_connected:
+        return (
+            html.Div("⚠ Arduino no está conectado. Conéctalo para ver datos.", className="mb-0"), True, "warning",
+            html.Div(""), False, "success",  # Ocultar alerta de humedad
+            html.Div(""), False, "success",  # Ocultar alerta de temperatura
+            html.Div(""), False, "success"   # Ocultar alerta de humedad ambiental
+        )
+    
+    # Notificación para humedad del suelo
+    humedad_message = ""
+    humedad_color = "success"
+    if target_humedad < 30:
+        humedad_message = "⚠ Suelo muy seco, ¡necesita riego!"
+        humedad_color = "danger"
+    elif target_humedad > 80:
+        humedad_message = "✅ Suelo muy húmedo, no riegue."
+        humedad_color = "info"
+    else:
+        humedad_message = "🌱 Suelo en buen estado."
+
+    # Notificación para temperatura
+    temperatura_message = ""
+    temperatura_color = "success"
+    if target_temperatura < 20:
+        temperatura_message = "⚠ Temperatura demasiado baja, riesgo para las plantas."
+        temperatura_color = "danger"
+    elif target_temperatura > 30:
+        temperatura_message = "⚠ Temperatura demasiado alta, riesgo para las plantas."
+        temperatura_color = "danger"
+    else:
+        temperatura_message = "✅ Temperatura óptima."
+
+    # Notificación para humedad ambiental
+    humedad_ambiente_message = ""
+    humedad_ambiente_color = "success"
+    if target_humedad_ambiente < 40:
+        humedad_ambiente_message = "⚠ Humedad ambiental baja, considere humidificar."
+        humedad_ambiente_color = "danger"
+    elif target_humedad_ambiente > 60:
+        humedad_ambiente_message = "⚠ Humedad ambiental alta, riesgo de moho."
+        humedad_ambiente_color = "warning"
+    else:
+        humedad_ambiente_message = "✅ Humedad ambiental óptima."
+
+    return (
+        html.Div(""), False, "warning",  # Ocultar alerta de conexión
+        html.Div(humedad_message, className="mb-0"), True, humedad_color,
+        html.Div(temperatura_message, className="mb-0"), True, temperatura_color,
+        html.Div(humedad_ambiente_message, className="mb-0"), True, humedad_ambiente_color
+    )
+
+# Callback para tabla y gráficos
+@app.callback(
+    [Output('data-table', 'data'),
      Output('data-table', 'style_data_conditional'),
+     Output('data-table', 'style_data'),
+     Output('data-table', 'style_header'),
      Output('humidity-bar-graph', 'figure'),
      Output('temperature-line-graph', 'figure'),
+     Output('humedad-ambiente-bar-graph', 'figure'),
      Output('tasks-text', 'children'),
      Output('tasks-bar-style', 'style'),
      Output('pending-text', 'children'),
      Output('pending-bar-style', 'style')],
-    Input('interval-component', 'n_intervals')
+    [Input('interval-component', 'n_intervals')]
 )
-def update_dashboard(n):
-    global humedad_valor, nivel_riego_valor, temperatura_valor, is_connected, target_humedad, target_agua, target_temperatura, data_history
+def update_table_and_graphs(n):
+    global is_connected, target_humedad, data_history
+    table_data = [{"timestamp": row[0], "humedad": row[1], "temperatura": row[3], "humedad_ambiente": row[4]} for row in data_history]
+    table_style_conditional = [{'if': {'state': 'active'}, 'backgroundColor': '#495057', 'color': '#e0e0e0'}] if not is_connected else []
+    table_style_data = {'backgroundColor': '#2c3b41', 'color': '#e0e0e0', 'border': '1px solid #4b5e6b'}
+    table_style_header = {'backgroundColor': '#007bff', 'color': 'white', 'fontWeight': 'bold', 'border': 'none'}
 
-    # Actualizar valores con transición suave
-    fig_hum, humedad_valor = semicircular_gauge(humedad_valor, target_humedad,
-                                              colors={'bar': '#4e73df', 'background': '#e0e0e0'},
-                                              title="Humedad", is_active=is_connected)
-    fig_agua, nivel_riego_valor = semicircular_gauge(nivel_riego_valor, target_agua,
-                                                   colors={'bar': '#36b9cc', 'background': '#e0e0e0'},
-                                                   title="Agua", is_active=is_connected)
-    fig_temp, temperatura_valor = semicircular_gauge(temperatura_valor, target_temperatura,
-                                                   colors={'bar': '#e74a3b', 'background': '#e0e0e0'},
-                                                   title="Temperatura", suffix="°C", is_active=is_connected, max_value=50)
-
-    # Lógica de notificaciones
-    if not is_connected:
-        notification = html.Div("⚠ Arduino no está conectado. Conéctalo para ver datos.", className="mb-0")
-        is_open = True
-        color = "warning"
-    else:
-        # Condiciones para humedad
-        humedad_message = ""
-        humedad_color = "success"
-        if target_humedad < 30:
-            humedad_message = "⚠ Suelo muy seco, ¡necesita riego!"
-            humedad_color = "danger"
-        elif target_humedad > 80:
-            humedad_message = "✅ Suelo muy húmedo, no riegue."
-            humedad_color = "info"
-        else:
-            humedad_message = "🌱 Suelo en buen estado."
-
-        # Condiciones para temperatura
-        temperatura_message = ""
-        temperatura_color = "success"
-        if target_temperatura < 20:
-            temperatura_message = "⚠ Temperatura demasiado baja, riesgo para las plantas."
-            temperatura_color = "danger"
-        elif target_temperatura > 30:
-            temperatura_message = "⚠ Temperatura demasiado alta, riesgo para las plantas."
-            temperatura_color = "danger"
-        else:
-            temperatura_message = "✅ Temperatura óptima."
-
-        # Combinar mensajes y determinar color
-        if humedad_color == "danger" or temperatura_color == "danger":
-            color = "danger"
-            if humedad_message and temperatura_message:
-                notification = html.Div(f"{humedad_message} | {temperatura_message}", className="mb-0")
-            else:
-                notification = html.Div(humedad_message or temperatura_message, className="mb-0")
-        elif humedad_color == "info" or temperatura_color == "info":
-            color = "info"
-            if humedad_message and temperatura_message:
-                notification = html.Div(f"{humedad_message} | {temperatura_message}", className="mb-0")
-            else:
-                notification = html.Div(humedad_message or temperatura_message, className="mb-0")
-        else:
-            color = "success"
-            notification = html.Div(f"{humedad_message} | {temperatura_message}", className="mb-0")
-        is_open = True
-
-    # Preparar datos de la tabla
-    table_data = [{"timestamp": row[0], "humedad": row[1], "agua": row[2], "temperatura": row[3]} for row in data_history]
-
-    # Estilo condicional para la tabla
-    table_style = [
-        {
-            'if': {'state': 'active'},
-            'backgroundColor': '#f8f9fa',
-            'color': '#6c757d'
-        }
-    ] if not is_connected else []
-
-    # Gráfico de barras para humedad
+    # Gráfico de humedad del suelo
     bar_fig = go.Figure()
-    if is_connected:
+    if is_connected and data_history:
         timestamps = [row[0] for row in data_history]
         humidities = [row[1] for row in data_history]
-        colors = ['red' if h < 30 or h > 80 else 'green' for h in humidities]
+        colors = ['#ff4d4d' if h < 30 or h > 80 else '#007bff' for h in humidities]
         bar_fig.add_trace(go.Bar(x=timestamps, y=humidities, marker_color=colors))
         bar_fig.update_layout(
-            title="Tendencia de Humedad",
+            title="Tendencia de Humedad Suelo",
             xaxis_title="Hora",
             yaxis_title="Humedad (%)",
             yaxis_range=[0, 100],
             height=300,
-            margin=dict(t=40, b=40, l=40, r=40)
+            margin=dict(t=40, b=40, l=40, r=40),
+            paper_bgcolor='#1e2b33',
+            plot_bgcolor='#1e2b33',
+            font={'color': '#e0e0e0'},
+            xaxis=dict(gridcolor='#4b5e6b'),
+            yaxis=dict(gridcolor='#4b5e6b')
         )
     else:
         bar_fig.add_annotation(
@@ -418,28 +484,29 @@ def update_dashboard(n):
             xref="paper", yref="paper",
             x=0.5, y=0.5,
             showarrow=False,
-            font=dict(size=20, color="#888"),
+            font=dict(size=20, color='#888'),
             opacity=0.7
         )
         bar_fig.update_layout(
             height=300,
             margin=dict(t=40, b=40, l=40, r=40),
-            plot_bgcolor='rgba(240,240,240,0.5)',
-            paper_bgcolor='rgba(240,240,240,0.5)'
+            paper_bgcolor='#1e2b33',
+            plot_bgcolor='#1e2b33',
+            font={'color': '#e0e0e0'}
         )
 
-    # Gráfico de líneas para temperatura
+    # Gráfico de temperatura
     line_fig = go.Figure()
     if is_connected and data_history:
         timestamps = [row[0] for row in data_history]
         temperatures = [row[3] for row in data_history]
-        colors = ['red' if t < 15 or t > 35 else 'blue' for t in temperatures]
+        colors = ['#ff4d4d' if t < 15 or t > 35 else '#ff4d4d' for t in temperatures]
         line_fig.add_trace(go.Scatter(
             x=timestamps,
             y=temperatures,
             mode='lines+markers',
             name='Temperatura (°C)',
-            line=dict(color='blue', width=2, shape='spline'),
+            line=dict(color='#ff4d4d', width=2, shape='spline'),
             marker=dict(size=8, color=colors)
         ))
         line_fig.update_layout(
@@ -448,38 +515,72 @@ def update_dashboard(n):
             yaxis_title="Temperatura (°C)",
             yaxis_range=[0, 50],
             height=300,
-            margin=dict(t=40, b=40, l=40, r=40)
+            margin=dict(t=40, b=40, l=40, r=40),
+            paper_bgcolor='#1e2b33',
+            plot_bgcolor='#1e2b33',
+            font={'color': '#e0e0e0'},
+            xaxis=dict(gridcolor='#4b5e6b'),
+            yaxis=dict(gridcolor='#4b5e6b')
         )
     else:
         line_fig.add_annotation(
             text="Desconectado",
-            xref="paper",
-            yref="paper",
-            x=0.5,
-            y=0.5,
+            xref="paper", yref="paper",
+            x=0.5, y=0.5,
             showarrow=False,
-            font=dict(size=20, color="#888"),
+            font=dict(size=20, color='#888'),
             opacity=0.7
         )
         line_fig.update_layout(
             height=300,
             margin=dict(t=40, b=40, l=40, r=40),
-            plot_bgcolor='rgba(240,240,240,0.5)',
-            paper_bgcolor='rgba(240,240,240,0.5)'
+            paper_bgcolor='#1e2b33',
+            plot_bgcolor='#1e2b33',
+            font={'color': '#e0e0e0'}
+        )
+
+    # Gráfico de humedad ambiental
+    hum_amb_fig = go.Figure()
+    if is_connected and data_history:
+        timestamps = [row[0] for row in data_history]
+        hum_ambientes = [row[4] for row in data_history]
+        colors = ['#ff4d4d' if h < 30 or h > 80 else '#1cc88a' for h in hum_ambientes]
+        hum_amb_fig.add_trace(go.Bar(x=timestamps, y=hum_ambientes, marker_color=colors))
+        hum_amb_fig.update_layout(
+            title="Humedad Ambiental",
+            xaxis_title="Hora",
+            yaxis_title="Humedad Ambiental (%)",
+            yaxis_range=[0, 100],
+            height=300,
+            margin=dict(t=40, b=40, l=40, r=40),
+            paper_bgcolor='#1e2b33',
+            plot_bgcolor='#1e2b33',
+            font={'color': '#e0e0e0'},
+            xaxis=dict(gridcolor='#4b5e6b'),
+            yaxis=dict(gridcolor='#4b5e6b')
+        )
+    else:
+        hum_amb_fig.add_annotation(
+            text="Desconectado",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5,
+            showarrow=False,
+            font=dict(size=20, color='#888'),
+            opacity=0.7
+        )
+        hum_amb_fig.update_layout(
+            height=300,
+            margin=dict(t=40, b=40, l=40, r=40),
+            paper_bgcolor='#1e2b33',
+            plot_bgcolor='#1e2b33',
+            font={'color': '#e0e0e0'}
         )
 
     valores_en_ultima_hora = obtener_valores_ultima_hora(data_history)
-
     if is_connected:
-        # Tasks: estimación de tiempo de riego en minutos
-        if target_humedad < 30:
-            tiempo_riego = (30 - target_humedad) * 2  # 2 minutos por cada % bajo
-        else:
-            tiempo_riego = 0
+        tiempo_riego = (30 - target_humedad) * 2 if target_humedad < 30 else 0
         tasks_text = f"Tiempo riego estimado: {tiempo_riego:.0f} min" if tiempo_riego > 0 else "Riego no necesario"
-        tasks_bar_width = f"{min(tiempo_riego * 3, 100)}%"  # max 100%
-
-        # Pending Requests: lecturas óptimas (30-80%)
+        tasks_bar_width = f"{min(tiempo_riego * 3, 100)}%"
         conteo_optimo = sum(1 for v in valores_en_ultima_hora if 30 <= v[1] <= 80)
         pending_text = f"Lecturas óptimas: {conteo_optimo}"
         pending_bar_width = f"{min(conteo_optimo * 10, 100)}%"
@@ -490,16 +591,13 @@ def update_dashboard(n):
         pending_bar_width = "0%"
 
     return (
-        dcc.Graph(figure=fig_hum),
-        dcc.Graph(figure=fig_agua),
-        dcc.Graph(figure=fig_temp),
-        notification,
-        is_open,
-        color,
         table_data,
-        table_style,
+        table_style_conditional,
+        table_style_data,
+        table_style_header,
         bar_fig,
         line_fig,
+        hum_amb_fig,
         tasks_text,
         {"width": tasks_bar_width, "backgroundColor": "#1cc88a"},
         pending_text,
@@ -508,4 +606,4 @@ def update_dashboard(n):
 
 if __name__ == '__main__':
     # app.run(debug=True, use_reloader=False)
-    app.run(host='0.0.0.0', port=8050, debug=True, use_reloader=False) #PARA VER EN TÚ CELULAR CON LA MISMA RED
+    app.run(host='0.0.0.0', port=8050, debug=True, use_reloader=False)
